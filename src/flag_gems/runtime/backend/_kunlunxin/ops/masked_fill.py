@@ -212,8 +212,19 @@ def masked_fill(inp, mask, value):
         flat_mask = mask.view(-1)
         flat_out = out.view(-1)
         num_tasks = flat_in.numel()
-        if kernel is masked_fill_kernel and 8192 <= num_tasks <= 131072:
-            # Single-CTA trap region: use the full-machine monolithic kernel.
+        if kernel is masked_fill_kernel and num_tasks <= 131072:
+            # Single-CTA trap region (N<=2048*64=131072). The generated
+            # autoGrid pointwise path launches ONE CTA here, and for tiny N its
+            # Python-side dispatch (shape analysis / grid build / instantiate)
+            # dominates wall time: full-dispatch do_bench measures 22-44us at
+            # N=4096 vs torch ~5us. The hand-written constexpr mono kernel is a
+            # direct 12-CTA launch (= P800 cluster_num, full machine) with far
+            # less host overhead: at N=4096 it drops to 6-7us (probe2, card 7),
+            # i.e. fp16 0.20->0.71, fp32 0.24->0.93, bf16 0.25->0.81. It also
+            # wins across 8192<=N<=131072 (16-55%). Above 131072 the generated
+            # 12-CTA path's block-DMA pipelining wins decisively, and >=1<<20
+            # is handled by _masked_fill_fast, so mono is used strictly for the
+            # single-CTA trap region.
             block = triton.next_power_of_2(triton.cdiv(num_tasks, 12))
             masked_fill_small_kernel[(12,)](
                 flat_in,
@@ -267,12 +278,22 @@ def masked_fill_(inp, mask, value):
         flat_in = inp.view(-1)
         flat_mask = mask.view(-1)
         num_tasks = flat_in.numel()
-        if kernel is masked_fill_kernel and 8192 <= num_tasks <= 131072:
-            # Same single-CTA trap-region rule as out-of-place masked_fill: the
-            # generated autoGrid path would launch ONE CTA here, while the
-            # monolithic kernel fills the machine with 12 CTAs. In-place is
-            # safe: every program loads its disjoint tile before storing it,
-            # and out_ptr aliases flat_in element-for-element.
+        if kernel is masked_fill_kernel and num_tasks <= 131072:
+            # Same single-CTA trap-region rule as out-of-place masked_fill
+            # (N<=2048*64=131072). The generated autoGrid path launches ONE CTA
+            # here, and for tiny N its Python-side dispatch (shape analysis /
+            # grid build / instantiate) dominates wall time: full-dispatch
+            # do_bench measures 13-14us at N=4096 vs torch ~5us. The
+            # hand-written constexpr mono kernel is a direct 12-CTA launch
+            # (= P800 cluster_num, full machine) with far less host overhead:
+            # at N=4096 it drops to 5-8us, i.e. fp16 0.39->~0.66, fp32
+            # 0.37->~0.94, bf16 0.40->~0.69. It also wins across
+            # 8192<=N<=131072 (16-55%). Above 131072 the generated 12-CTA
+            # path's block-DMA pipelining wins decisively, and >=1<<20 is
+            # handled by _masked_fill_fast, so mono is used strictly for the
+            # single-CTA trap region. In-place is safe: every program loads its
+            # disjoint tile before storing it, and out_ptr aliases flat_in
+            # element-for-element.
             block = triton.next_power_of_2(triton.cdiv(num_tasks, 12))
             masked_fill_small_kernel[(12,)](
                 flat_in,

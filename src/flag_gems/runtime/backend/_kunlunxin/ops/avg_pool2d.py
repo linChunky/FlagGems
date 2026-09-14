@@ -790,7 +790,7 @@ def avg_pool2d_backward(
         KW_TAPS=kw_taps,
         COUNT_INCLUDE_PAD=count_include_pad,
         divisor_override=divisor_override if divisor_override is not None else 0.0,
-        BLOCK_SIZE=1024,
+        BLOCK_SIZE=2048,
         num_warps=4,
     )
 

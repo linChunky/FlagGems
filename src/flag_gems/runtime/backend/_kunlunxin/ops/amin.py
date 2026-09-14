@@ -303,10 +303,15 @@ def amin(inp, dim=None, keepdim=False):
         M = inp.numel() // N
 
         if N == 1:
+            # The reduced dim(s) collapse to a single element, so the result is
+            # just a copy of `inp`.  Use the native strided-copy engine
+            # (`aten::_copy_from`, HARNESS 2.4) rather than `tle_copy`: the tle
+            # TMA tile path faults (RUNTIME ERROR 714) on tiny contiguous
+            # tensors such as the (1, 2) dim=0 functional case, and this branch
+            # is never on a measured (core) reduction path anyway.
             out = torch.empty(shape, dtype=dtype, device=inp.device)
             with torch_device_fn.device(inp.device):
-                if not tle_copy(inp, out):
-                    torch.ops.aten._copy_from(inp, out, False)
+                torch.ops.aten._copy_from(inp, out, False)
             if not keepdim:
                 out = out.squeeze(dim=dim)
             return out

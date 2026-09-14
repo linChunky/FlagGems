@@ -813,6 +813,59 @@ def softmax_backward_kernel_tail_pass(
     tl.store(in_grad_ptr + pid * N + PREV + tno, o * (g - scale), mask=tmask)
 
 
+@triton.jit
+def softmax_backward_kernel_split_partial(
+    out_ptr,
+    out_grad_ptr,
+    partial_ptr,
+    N,
+    CH,
+    G,
+    W: tl.constexpr,
+):
+    # 2D grid (row, chunk): each CTA reduces sum(out*grad) over one chunk of a
+    # row. Offsets are pid*constant (multiply, not div/mod) so this avoids the
+    # flat-grid pid//C, pid%C miscompile. CH is a multiple of W, so tiles are
+    # fully dense (no masked tail -> safe for bf16).
+    m = tl.program_id(0)
+    c = tl.program_id(1)
+    base = m * N + c * CH
+    acc = tl.zeros([W], dtype=tl.float32)
+    for start_n in range(0, CH, W):
+        offs = base + start_n + tl.arange(0, W)
+        og = tl.load(out_grad_ptr + offs).to(tl.float32)
+        o = tl.load(out_ptr + offs).to(tl.float32)
+        acc += o * og
+    tl.store(partial_ptr + m * G + c, tl.sum(acc, 0))
+
+
+@triton.jit
+def softmax_backward_kernel_split_pass(
+    in_grad_ptr,
+    out_ptr,
+    out_grad_ptr,
+    partial_ptr,
+    N,
+    CH,
+    G: tl.constexpr,
+    W: tl.constexpr,
+):
+    m = tl.program_id(0)
+    c = tl.program_id(1)
+    # Full-row scale = sum of the row's G chunk partials (G is a small pow2).
+    scale = tl.sum(tl.load(partial_ptr + m * G + tl.arange(0, G)), 0)
+    base = m * N + c * CH
+    for start_n in range(0, CH, W):
+        offs = base + start_n + tl.arange(0, W)
+        og = tl.load(out_grad_ptr + offs).to(tl.float32)
+        o = tl.load(out_ptr + offs).to(tl.float32)
+        tl.store(in_grad_ptr + offs, o * (og - scale))
+
+
+# Split large rows across chunks so few-row problems still fill all clusters.
+_SB_SPLIT_CLUSTERS = 8
+
+
 def _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype):
     if N <= _SB_MR_MAX_N:
         TILE_M = 4
@@ -844,15 +897,48 @@ def _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype)
             )
     else:
         if N % _SB_WIDE == 0:
-            grid = (M,)
-            softmax_backward_kernel_perrow_p2[grid](
-                output,
-                grad_output,
-                in_grad,
-                M,
-                N,
-                W=_SB_WIDE,
-            )
+            n_tiles = N // _SB_WIDE
+            G = 1
+            # Grow G (pow2, must divide n_tiles) until M rows * G chunks reach
+            # the cluster count, so few-row large-N cases fill all clusters
+            # instead of running on a single CTA.
+            while (n_tiles % (G * 2) == 0) and (M * (G * 2) <= _SB_SPLIT_CLUSTERS):
+                G *= 2
+            if G > 1:
+                CH = N // G
+                partial = torch.empty(
+                    (M * G,), dtype=torch.float32, device=in_grad.device
+                )
+                grid = (M, G)
+                softmax_backward_kernel_split_partial[grid](
+                    output,
+                    grad_output,
+                    partial,
+                    N,
+                    CH,
+                    G,
+                    W=_SB_WIDE,
+                )
+                softmax_backward_kernel_split_pass[grid](
+                    in_grad,
+                    output,
+                    grad_output,
+                    partial,
+                    N,
+                    CH,
+                    G=G,
+                    W=_SB_WIDE,
+                )
+            else:
+                grid = (M,)
+                softmax_backward_kernel_perrow_p2[grid](
+                    output,
+                    grad_output,
+                    in_grad,
+                    M,
+                    N,
+                    W=_SB_WIDE,
+                )
         elif N % 4096 == 0:
             grid = (M,)
             softmax_backward_kernel_perrow_p2[grid](
@@ -1061,6 +1147,20 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
     N = output.shape[dim]
     for i in range(dim):
         M *= output.shape[i]
+
+    if N == 1:
+        # Reduction over a size-1 dim: sum(out*grad) is a single term == out*grad,
+        # so in_grad = out*(grad - out*grad) elementwise. Compute this directly to
+        # avoid the degenerate K>1 transpose/strided-copy path, whose copy of a
+        # size-1 reduction dim crashes on XPU. fp32 accumulation matches the kernel.
+        og = grad_output.to(torch.float32)
+        oo = output.to(torch.float32)
+        res = (oo * (og - oo * og)).to(input_dtype)
+        if grad_input is not None:
+            if not tle_copy(res, grad_input):
+                torch.ops.aten._copy_from(res, grad_input, False)
+            return grad_input
+        return res
 
     grad_output = (
         grad_output if grad_output.is_contiguous() else _native_contiguous(grad_output)

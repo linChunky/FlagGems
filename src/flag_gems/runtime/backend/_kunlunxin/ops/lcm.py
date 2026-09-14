@@ -19,7 +19,13 @@ import triton.language as tl
 
 from flag_gems.ops.lcm import _materialize_inputs
 
-from .gcd import _ITERS_32, _ITERS_64
+# NOTE (kunlunxin/XPU): these are worst-case *Euclidean* loop trip counts
+# (Fibonacci chains): 32-bit <= 47 trips, 64-bit <= 93; the values add margin.
+# They used to live in gcd.py but were removed when gcd was rewritten to
+# binary GCD (whose _ITERS_U32/U64=36/72 are NOT valid Euclid bounds), so
+# they are defined here to keep lcm.py self-contained.
+_ITERS_32 = 48
+_ITERS_64 = 96
 
 logger = logging.getLogger(__name__)
 

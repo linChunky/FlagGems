@@ -174,12 +174,14 @@ def true_divide_(A, B):
 def divide(A, B):
     """Out-of-place division (aten::divide): alias of true_divide."""
     logger.debug("GEMS_KUNLUNXIN DIVIDE")
+    logging.getLogger("flag_gems.ops.divide").debug("GEMS DIVIDE")
     return true_divide(A, B)
 
 
 def true_divide_tensor_(A, B):
     """Canonical Tensor overload for in-place true division (aten::true_divide.Tensor_)."""
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
+    logging.getLogger("flag_gems.ops.true_divide_").debug("GEMS TRUE_DIVIDE_")
     return true_divide_(A, B)
 
 
