@@ -33,7 +33,15 @@ config_ = CodeGenConfig(
 @pointwise_dynamic(promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=config_)
 @triton.jit
 def _xlogy_fast(x, y):
-    return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
+    xf = x.to(tl.float32)
+    yf = y.to(tl.float32)
+    prod = xf * tl.log(yf)
+    # ATen xlogy semantics: x==0 -> 0 (even for y<=0), and y==NaN -> NaN.
+    res = tl.where(xf == 0.0, 0.0, prod)
+    y_bits = yf.to(tl.int32, bitcast=True)
+    y_nan = (y_bits & 0x7FFFFFFF) > 0x7F800000
+    res = tl.where(y_nan, float("nan"), res)
+    return res
 
 
 MIN_BLOCK = 2048

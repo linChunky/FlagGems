@@ -219,6 +219,60 @@ def all_min_kernel_dim(
 
 
 @libentry()
+@triton.jit
+def all_min_partial_rows(
+    inp,
+    mid,
+    R,
+    C,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    """Stage 1 of the parallel M==1 global float reduce.
+
+    Views the flat reduced buffer as a contiguous [R, C] grid and has each
+    program reduce BLOCK_M rows to a per-row min|x| (fp32) in `mid`. Grid =
+    cdiv(R, BLOCK_M) restores parallelism across the 64 cores, unlike the
+    single-program serial BLOCK_N-chunk loop (which ran one core at
+    ~45 G elem/s on [4096,4096]: 0.37ms vs this two-stage 0.10ms). C is a
+    power-of-2 that divides the element count so `cols < C` never masks;
+    only the row tail can need a mask when R % BLOCK_M != 0. Masked lanes
+    load other=1e30 (abs-min identity)."""
+    pid = ext.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    p = inp + rows * C
+    _min = tl.full([BLOCK_M, BLOCK_N], value=1e30, dtype=tl.float32)
+    for off in range(0, C, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        if NEED_MASK:
+            a = tl.load(p + cols, (rows < R) and (cols < C), other=1e30).to(
+                tl.float32
+            )
+        else:
+            a = tl.load(p + cols).to(tl.float32)
+        _min = tl.minimum(_min, tl.abs(a))
+    m = tl.min(_min, axis=1)[:, None]
+    if NEED_MASK:
+        tl.store(mid + rows, m, rows < R)
+    else:
+        tl.store(mid + rows, m)
+
+
+@libentry()
+@triton.jit
+def all_min_final(mid, out, R, BLOCK_R: tl.constexpr):
+    """Stage 2: a single program reduces the R per-row minima (fp32) from
+    stage 1 to one bool (global min|x| != 0). BLOCK_R = next_pow2(R); the
+    tail lanes load other=1e30 so they never lower the min."""
+    off = tl.arange(0, BLOCK_R)
+    mask = off < R
+    v = tl.load(mid + off, mask=mask, other=1e30)
+    m = tl.min(v, axis=0)
+    tl.store(out, m != 0)
+
+
+@libentry()
 @triton.heuristics(
     values={
         "BLOCK_M": heur_m_block_size,
@@ -430,6 +484,26 @@ def _move_dims_last_contig(inp, dims):
     return dst
 
 
+# M==1 (global) float reduce: above this element count the single-program
+# serial BLOCK_N-chunk loop (one core, ~45 G elem/s) loses badly to the
+# two-stage parallel min-abs (all cores). Below it the two launches + mid
+# buffer cost more than they save, and the serial path is already at/above
+# vendor parity (e.g. [1024,1024] N=1<<20 measured sp ~1.0). Crossover
+# empirically between 1<<20 (serial wins) and 1<<24 ([4096,4096] serial
+# sp 0.13); gate at 1<<22.
+_M1_TWOSTAGE_MIN = 1 << 22
+
+
+def _pick_2stage_cols(n):
+    """Largest power-of-2 column width in [8192, 65536] that divides `n`, so
+    the flat reduced buffer views as a dense [n // C, C] grid with no copy.
+    Returns 0 when no clean fit (caller keeps the serial single-launch)."""
+    for C in (65536, 32768, 16384, 8192):
+        if n % C == 0:
+            return C
+    return 0
+
+
 def _all_dims_pick_blocks(M, N, is_bool):
     """Host-side tile selection for the [M, N] per-row all reduction.
 
@@ -496,6 +570,48 @@ def all_dims(inp, dim=None, keepdim=False):
                     buffer_size_limit=2048,
                 )
         else:
+            # Large global float reduce: the single-program serial loop is
+            # one-core-bound (sp ~0.13 at 1<<24). View the flat buffer as a
+            # dense [R, C] grid and reduce in parallel (stage 1: per-row
+            # min|x| across all cores; stage 2: min over the R partials).
+            # Measured [4096,4096] 0.37ms -> 0.10ms (sp 0.13 -> ~0.5). Falls
+            # back to the serial single-launch when the buffer is too small
+            # to amortise the second launch, or has no clean power-of-2
+            # column width for the zero-copy [R, C] view.
+            C = _pick_2stage_cols(N) if N >= _M1_TWOSTAGE_MIN else 0
+            if C:
+                R = N // C
+                if C >= 65536:
+                    block_m, block_n = 32, 8192
+                else:
+                    block_m, block_n = 64, 4096
+                block_m = min(block_m, max(1, triton.next_power_of_2(R)))
+                inp2d = inp.reshape(R, C)
+                need_mask = R % block_m != 0
+                mid = torch.empty((R,), dtype=torch.float32, device=inp.device)
+                out = torch.empty(shape, dtype=torch.bool, device=inp.device)
+                grid = (triton.cdiv(R, block_m),)
+                with torch_device_fn.device(inp.device):
+                    all_min_partial_rows[grid](
+                        inp2d,
+                        mid,
+                        R,
+                        C,
+                        BLOCK_M=block_m,
+                        BLOCK_N=block_n,
+                        NEED_MASK=need_mask,
+                        buffer_size_limit=2048,
+                    )
+                    all_min_final[(1,)](
+                        mid,
+                        out,
+                        R,
+                        BLOCK_R=triton.next_power_of_2(R),
+                        buffer_size_limit=2048,
+                    )
+                if not keepdim:
+                    out = out.reshape([])
+                return out
             block_n = 32768
             with torch_device_fn.device(inp.device):
                 out = torch.empty(shape, dtype=torch.bool, device=inp.device)

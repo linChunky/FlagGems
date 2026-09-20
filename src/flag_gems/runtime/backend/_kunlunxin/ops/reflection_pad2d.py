@@ -21,8 +21,6 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 
-from ..utils.tle_copy import tle_copy
-
 logger = logging.getLogger(__name__)
 
 
@@ -196,13 +194,17 @@ def interior_copy_kernel(
 def _launch_reflection_pad2d_split(
     x, out, pad_left, pad_right, pad_top, pad_bottom, H_in, W_in, H_out, W_out, B
 ):
-    """Big-shape split: copy-family recipe (tle SDNN row transfer, Triton
-    fallback) for the contiguous interior + two small Triton kernels for the
-    H-side (top/bottom rows) and W-side (interior left/right columns) borders.
-    No `torch.ops.aten.slice` / `_copy_from` here: slice is intercepted by gems
-    and `_copy_from` lands on the XPU fallback, so both are replaced by the
-    same copy-family path as alias_copy / lift_out (tle first, pointwise
-    fallback)."""
+    """Big-shape split: native strided-copy DMA engine
+    (`torch.ops.aten._copy_from`) for the contiguous interior + two small
+    Triton kernels for the H-side (top/bottom rows) and W-side (interior
+    left/right columns) borders. `_copy_from(src, dst, False)` is the fast
+    vendor strided-copy engine (NOT a fallback: gems does not override it), so
+    the interior lands as a hardware row DMA into the strided output view.
+    `tle_copy(x, interior)` cannot express this copy because x is B*H_in*W_in
+    contiguous while interior is a 3-D strided view of `out` -- tle_copy's
+    `src_v.shape != dst_v.shape` guard returns False and drops to the
+    launch-bound `interior_copy_kernel` (measured 15 ms for the 256K-row case),
+    so we reshape x to (B, H_in, W_in) and hand it straight to `_copy_from`."""
     HW_out = H_out * W_out
     HW_in = H_in * W_in
     interior_off = pad_top * W_out + pad_left
@@ -214,7 +216,13 @@ def _launch_reflection_pad2d_split(
             stride=(HW_out, W_out, 1),
             storage_offset=interior_off,
         )
-        if not tle_copy(x, interior):
+        # Fast native strided-copy DMA (shapes must match: reshape the
+        # contiguous input to the interior's (B, H_in, W_in)). Falls back to
+        # the affine interior_copy_kernel only if the engine raises.
+        try:
+            src3 = x.reshape(B, H_in, W_in)
+            torch.ops.aten._copy_from(src3, interior, False)
+        except Exception:
             grid = (B * H_in, triton.cdiv(W_in, 4096))
             interior_copy_kernel[grid](
                 x,
@@ -349,10 +357,12 @@ def launch_reflection_pad2d(input: torch.Tensor, padding, out: torch.Tensor = No
             B,
         )
 
-    # BLOCK=1024 is the best all-round tile on XPU: small shapes avoid the
-    # per-program waste of a huge block, while medium/large shapes still get
-    # enough work per program to stay off the launch floor (measured sweep).
-    BLOCK = 1024
+    # BLOCK sweep (round-2 §9.4): 2048 is measurably faster (~8%) than 1024
+    # once total_out is large enough to keep every program off the launch
+    # floor (>= 262144); below that a huge block only wastes per-program work,
+    # so small shapes keep 1024. Only benchmark case3 (663K) crosses the
+    # threshold; case1 (3.5K)/case2 (20K) are byte-for-byte unchanged.
+    BLOCK = 2048 if total_out >= 262144 else 1024
     grid = (triton.cdiv(total_out, BLOCK),)
     with torch_device_fn.device(x.device):
         reflection_pad2d_kernel[grid](
